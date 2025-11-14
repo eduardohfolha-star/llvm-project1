@@ -1,174 +1,161 @@
-"""Script for getting explanations from the premerge advisor."""
+#!/usr/bin/env bash
+#===----------------------------------------------------------------------===##
+#
+# Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+# See https://llvm.org/LICENSE.txt for license information.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+#
+#===----------------------------------------------------------------------===##
 
-import argparse
-import json
-import platform
-import sys
-from typing import Optional
+#
+# This script performs a monolithic build of the monorepo and runs the tests of
+# most projects on Linux. This should be replaced by per-project scripts that
+# run only the relevant tests.
+#
 
-import requests
-import github
-import github.PullRequest
+set -e
+set -o pipefail
 
-import generate_test_report_lib
+source .ci/utils.sh
 
-PREMERGE_ADVISOR_URL = (
-    "http://premerge-advisor.premerge-advisor.svc.cluster.local:5000/explain"
-)
-COMMENT_TAG = "<!--PREMERGE ADVISOR COMMENT: {platform}-->"
+# Configuration
+readonly INSTALL_DIR="${BUILD_DIR}/install"
+readonly ARTIFACTS_DIR="${MONOREPO_ROOT}/artifacts"
+readonly REPRODUCERS_DIR="${ARTIFACTS_DIR}/reproducers"
+readonly LIT_ARGS="-v --xunit-xml-output ${BUILD_DIR}/test-results.xml --use-unique-output-file-name --timeout=1200 --time-tests --succinct"
+
+# Parse arguments
+readonly PROJECTS="${1}"
+readonly TARGETS="${2}"
+readonly RUNTIMES="${3}"
+readonly RUNTIME_TARGETS="${4}"
+readonly RUNTIME_TARGETS_NEEDS_RECONFIG="${5}"
+readonly ENABLE_CIR="${6}"
 
 
-class GitHubCommentManager:
-    """Gerencia comentários no GitHub para o premerge advisor."""
+setup_environment() {
+    """Configure the build environment."""
+    mkdir -p "${REPRODUCERS_DIR}"
     
-    def __init__(self, github_token: str, pr_number: int):
-        self.github = github.Github(github_token)
-        self.repo = self.github.get_repo("llvm/llvm-project")
-        self.pr = self.repo.get_issue(pr_number).as_pull_request()
-
-    def get_existing_comment_id(self, platform_name: str) -> Optional[int]:
-        """Obtém o ID de um comentário existente para a plataforma."""
-        platform_tag = COMMENT_TAG.format(platform=platform_name)
-        
-        for comment in self.pr.as_issue().get_comments():
-            if platform_tag in comment.body:
-                return comment.id
-        return None
-
-    def prepare_comment_data(self, body: str, platform_name: str) -> dict:
-        """Prepara dados do comentário para a API do GitHub."""
-        comment = {"body": body}
-        comment_id = self.get_existing_comment_id(platform_name)
-        
-        if comment_id:
-            comment["id"] = comment_id
-            
-        return comment
-
-
-class PremergeAdvisorClient:
-    """Cliente para o serviço Premerge Advisor."""
+    # Make sure any clang reproducers will end up as artifacts
+    export CLANG_CRASH_DIAGNOSTICS_DIR="${REPRODUCERS_DIR}"
     
-    def __init__(self, base_url: str = PREMERGE_ADVISOR_URL):
-        self.base_url = base_url
-
-    def get_failure_explanations(self, commit_sha: str, platform_name: str, 
-                               failures: list[dict]) -> Optional[list]:
-        """Obtém explicações para falhas do premerge advisor."""
-        request_data = {
-            "base_commit_sha": commit_sha,
-            "platform": platform_name,
-            "failures": failures,
-        }
-        
-        try:
-            response = requests.get(self.base_url, json=request_data, timeout=10)
-            response.raise_for_status()
-            return response.json()
-        except requests.RequestException as error:
-            print(f"Error contacting premerge advisor: {error}")
-            return None
+    # Set the system llvm-symbolizer as preferred
+    export LLVM_SYMBOLIZER_PATH
+    LLVM_SYMBOLIZER_PATH=$(which llvm-symbolizer)
+    if [[ ! -f "${LLVM_SYMBOLIZER_PATH}" ]]; then
+        echo "Warning: llvm-symbolizer not found!"
+    fi
+}
 
 
-class FailureCollector:
-    """Coleta falhas de testes e builds."""
+run_cmake_configure() {
+    """Run CMake configuration."""
+    start-group "CMake Configuration"
+
+    cmake \
+        -S "${MONOREPO_ROOT}/llvm" \
+        -B "${BUILD_DIR}" \
+        -D LLVM_ENABLE_PROJECTS="${PROJECTS}" \
+        -D LLVM_ENABLE_RUNTIMES="${RUNTIMES}" \
+        -G Ninja \
+        -D CMAKE_PREFIX_PATH="${HOME}/.local" \
+        -D CMAKE_BUILD_TYPE=Release \
+        -D CLANG_ENABLE_CIR="${ENABLE_CIR}" \
+        -D LLVM_ENABLE_ASSERTIONS=ON \
+        -D LLVM_BUILD_EXAMPLES=ON \
+        -D COMPILER_RT_BUILD_LIBFUZZER=OFF \
+        -D LLVM_LIT_ARGS="${LIT_ARGS}" \
+        -D LLVM_ENABLE_LLD=ON \
+        -D CMAKE_CXX_FLAGS=-gmlt \
+        -D CMAKE_C_COMPILER_LAUNCHER=sccache \
+        -D CMAKE_CXX_COMPILER_LAUNCHER=sccache \
+        -D LIBCXX_CXX_ABI=libcxxabi \
+        -D MLIR_ENABLE_BINDINGS_PYTHON=ON \
+        -D LLDB_ENABLE_PYTHON=ON \
+        -D LLDB_ENFORCE_STRICT_TEST_REQUIREMENTS=ON \
+        -D CMAKE_INSTALL_PREFIX="${INSTALL_DIR}" \
+        -D CMAKE_EXE_LINKER_FLAGS="-no-pie" \
+        -D LLVM_ENABLE_WERROR=ON
+}
+
+
+build_main_targets() {
+    """Build the main project targets."""
+    start-group "Build Main Targets"
+
+    # Targets are not escaped as they are passed as separate arguments
+    ninja -C "${BUILD_DIR}" -k 0 ${TARGETS} |& tee "${MONOREPO_ROOT}/ninja.log"
+    cp "${BUILD_DIR}/.ninja_log" "${MONOREPO_ROOT}/ninja.ninja_log"
+}
+
+
+build_runtime_targets() {
+    """Build runtime targets if specified."""
+    if [[ -n "${RUNTIME_TARGETS}" ]]; then
+        start-group "Build Runtime Targets"
+        ninja -C "${BUILD_DIR}" ${RUNTIME_TARGETS} |& tee "${MONOREPO_ROOT}/ninja_runtimes.log"
+        cp "${BUILD_DIR}/.ninja_log" "${MONOREPO_ROOT}/ninja_runtimes.ninja_log"
+    fi
+}
+
+
+build_runtimes_with_reconfig() {
+    """Build runtimes that need reconfiguration with different settings."""
+    if [[ -n "${RUNTIME_TARGETS_NEEDS_RECONFIG}" ]]; then
+        build_runtimes_cpp26
+        build_runtimes_clang_modules
+    fi
+}
+
+
+build_runtimes_cpp26() {
+    """Build runtimes with C++26 standard."""
+    start-group "Reconfigure for C++26"
     
-    def __init__(self):
-        self.report_generator = generate_test_report_lib.TestReportGenerator()
+    cmake \
+        -D LIBCXX_TEST_PARAMS="std=c++26" \
+        -D LIBCXXABI_TEST_PARAMS="std=c++26" \
+        "${BUILD_DIR}"
 
-    def collect_failures(self, build_log_files: list[str]) -> list[dict]:
-        """Coleta todas as falhas de testes e builds."""
-        junit_objects, ninja_logs = generate_test_report_lib.load_info_from_files(build_log_files)
-        failures = []
-        
-        # Coleta falhas de testes
-        test_failures = self.report_generator.get_test_failures(junit_objects)
-        for suite_failures in test_failures.values():
-            for test_name, failure_message in suite_failures:
-                failures.append({
-                    "name": test_name,
-                    "message": failure_message
-                })
-        
-        # Se não há falhas de testes, coleta falhas de build
-        if not failures:
-            ninja_failures = self.report_generator.find_failures_in_ninja_logs(ninja_logs)
-            for action_name, failure_message in ninja_failures:
-                failures.append({
-                    "name": action_name, 
-                    "message": failure_message
-                })
-                
-        return failures
+    start-group "Build Runtimes with C++26"
+    ninja -C "${BUILD_DIR}" ${RUNTIME_TARGETS_NEEDS_RECONFIG} |& tee "${MONOREPO_ROOT}/ninja_runtimes_cpp26.log"
+    cp "${BUILD_DIR}/.ninja_log" "${MONOREPO_ROOT}/ninja_runtimes_cpp26.ninja_log"
+}
 
 
-def main(commit_sha: str, build_log_files: list[str], github_token: str,
-         pr_number: int, return_code: int):
-    """Função principal do script."""
+build_runtimes_clang_modules() {
+    """Build runtimes with Clang modules."""
+    start-group "Reconfigure for Clang Modules"
     
-    # Skip em ARM64 temporariamente
-    if platform.machine() == "arm64":
-        print("Skipping premerge advisor on ARM64")
-        return
+    cmake \
+        -D LIBCXX_TEST_PARAMS="enable_modules=clang" \
+        -D LIBCXXABI_TEST_PARAMS="enable_modules=clang" \
+        "${BUILD_DIR}"
 
-    current_platform = f"{platform.system()}-{platform.machine()}".lower()
-    comment_manager = GitHubCommentManager(github_token, pr_number)
-    
-    if return_code == 0:
-        # Build bem-sucedido - atualiza comentário existente
-        comment_body = (
-            ":white_check_mark: With the latest revision this PR passed "
-            "the premerge checks."
-        )
-        comment_data = comment_manager.prepare_comment_data(comment_body, current_platform)
-        
-        with open("comment", "w", encoding="utf-8") as comment_file:
-            json.dump([comment_data], comment_file)
-        return
-
-    # Build falhou - processa falhas
-    failure_collector = FailureCollector()
-    advisor_client = PremergeAdvisorClient()
-    
-    failures = failure_collector.collect_failures(build_log_files)
-    explanations = advisor_client.get_failure_explanations(commit_sha, current_platform, failures)
-    
-    # Gera relatório com explicações
-    junit_objects, ninja_logs = generate_test_report_lib.load_info_from_files(build_log_files)
-    report = generate_test_report_lib.generate_report(
-        generate_test_report_lib.compute_platform_title(),
-        return_code,
-        junit_objects,
-        ninja_logs,
-        failure_explanations_list=explanations or []
-    )
-    
-    comment_data = comment_manager.prepare_comment_data(report, current_platform)
-    
-    with open("comment", "w", encoding="utf-8") as comment_file:
-        json.dump([comment_data], comment_file)
+    start-group "Build Runtimes with Clang Modules"
+    ninja -C "${BUILD_DIR}" ${RUNTIME_TARGETS_NEEDS_RECONFIG} |& tee "${MONOREPO_ROOT}/ninja_runtimes_clang_modules.log"
+    cp "${BUILD_DIR}/.ninja_log" "${MONOREPO_ROOT}/ninja_runtimes_clang_modules.ninja_log"
+}
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Get explanations from premerge advisor and update GitHub comments"
-    )
-    parser.add_argument("commit_sha", help="The base commit SHA for the test.")
-    parser.add_argument("return_code", type=int, help="The build's return code")
-    parser.add_argument("github_token", help="GitHub authentication token")
-    parser.add_argument("pr_number", type=int, help="The PR number")
-    parser.add_argument(
-        "build_log_files", 
-        nargs="*", 
-        help="Paths to JUnit report files and ninja logs."
-    )
-    
-    args = parser.parse_args()
+main() {
+    """Main build function."""
+    echo "Starting monolithic Linux build..."
+    echo "Projects: ${PROJECTS}"
+    echo "Targets: ${TARGETS}"
+    echo "Runtimes: ${RUNTIMES}"
+    echo "Enable CIR: ${ENABLE_CIR}"
 
-    main(
-        args.commit_sha,
-        args.build_log_files,
-        args.github_token,
-        args.pr_number,
-        args.return_code,
-    )
+    setup_environment
+    run_cmake_configure
+    build_main_targets
+    build_runtime_targets
+    build_runtimes_with_reconfig
+
+    echo "Monolithic Linux build completed successfully!"
+}
+
+
+# Run main function
+main "$@"
