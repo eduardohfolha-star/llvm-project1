@@ -1,15 +1,9 @@
-# Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
-# See https://llvm.org/LICENSE.txt for license information.
-# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 """Script for getting explanations from the premerge advisor."""
 
 import argparse
+import json
 import platform
 import sys
-import json
-
-# TODO(boomanaiden154): Remove the optional call once we can require Python
-# 3.10.
 from typing import Optional
 
 import requests
@@ -24,131 +18,152 @@ PREMERGE_ADVISOR_URL = (
 COMMENT_TAG = "<!--PREMERGE ADVISOR COMMENT: {platform}-->"
 
 
-def get_comment_id(platform: str, pr: github.PullRequest.PullRequest) -> Optional[int]:
-    platform_comment_tag = COMMENT_TAG.format(platform=platform)
-    for comment in pr.as_issue().get_comments():
-        if platform_comment_tag in comment.body:
-            return comment.id
-    return None
+class GitHubCommentManager:
+    """Gerencia comentários no GitHub para o premerge advisor."""
+    
+    def __init__(self, github_token: str, pr_number: int):
+        self.github = github.Github(github_token)
+        self.repo = self.github.get_repo("llvm/llvm-project")
+        self.pr = self.repo.get_issue(pr_number).as_pull_request()
+
+    def get_existing_comment_id(self, platform_name: str) -> Optional[int]:
+        """Obtém o ID de um comentário existente para a plataforma."""
+        platform_tag = COMMENT_TAG.format(platform=platform_name)
+        
+        for comment in self.pr.as_issue().get_comments():
+            if platform_tag in comment.body:
+                return comment.id
+        return None
+
+    def prepare_comment_data(self, body: str, platform_name: str) -> dict:
+        """Prepara dados do comentário para a API do GitHub."""
+        comment = {"body": body}
+        comment_id = self.get_existing_comment_id(platform_name)
+        
+        if comment_id:
+            comment["id"] = comment_id
+            
+        return comment
 
 
-def get_comment(
-    github_token: str,
-    pr_number: int,
-    body: str,
-) -> dict[str, str]:
-    repo = github.Github(github_token).get_repo("llvm/llvm-project")
-    pr = repo.get_issue(pr_number).as_pull_request()
-    comment = {"body": body}
-    comment_id = get_comment_id(platform.system(), pr)
-    if comment_id:
-        comment["id"] = comment_id
-    return comment
+class PremergeAdvisorClient:
+    """Cliente para o serviço Premerge Advisor."""
+    
+    def __init__(self, base_url: str = PREMERGE_ADVISOR_URL):
+        self.base_url = base_url
+
+    def get_failure_explanations(self, commit_sha: str, platform_name: str, 
+                               failures: list[dict]) -> Optional[list]:
+        """Obtém explicações para falhas do premerge advisor."""
+        request_data = {
+            "base_commit_sha": commit_sha,
+            "platform": platform_name,
+            "failures": failures,
+        }
+        
+        try:
+            response = requests.get(self.base_url, json=request_data, timeout=10)
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as error:
+            print(f"Error contacting premerge advisor: {error}")
+            return None
 
 
-def main(
-    commit_sha: str,
-    build_log_files: list[str],
-    github_token: str,
-    pr_number: int,
-    return_code: int,
-):
-    """The main entrypoint for the script.
+class FailureCollector:
+    """Coleta falhas de testes e builds."""
+    
+    def __init__(self):
+        self.report_generator = generate_test_report_lib.TestReportGenerator()
 
-    This function parses failures from files, requests information from the
-    premerge advisor, and may write a Github comment depending upon the output.
-    There are four different scenarios:
-    1. There has never been a previous failure and the job passes - We do not
-       create a comment. We write out an empty file to the comment path so the
-       issue-write workflow knows not to create anything.
-    2. There has never been a previous failure and the job fails - We create a
-       new comment containing the failure information and any possible premerge
-       advisor findings.
-    3. There has been a previous failure and the job passes - We update the
-       existing comment by passing its ID and a passed message to the
-       issue-write workflow.
-    4. There has been a previous failure and the job fails - We update the
-       existing comment in the same manner as above, but generate the comment
-       as if we have a failure.
+    def collect_failures(self, build_log_files: list[str]) -> list[dict]:
+        """Coleta todas as falhas de testes e builds."""
+        junit_objects, ninja_logs = generate_test_report_lib.load_info_from_files(build_log_files)
+        failures = []
+        
+        # Coleta falhas de testes
+        test_failures = self.report_generator.get_test_failures(junit_objects)
+        for suite_failures in test_failures.values():
+            for test_name, failure_message in suite_failures:
+                failures.append({
+                    "name": test_name,
+                    "message": failure_message
+                })
+        
+        # Se não há falhas de testes, coleta falhas de build
+        if not failures:
+            ninja_failures = self.report_generator.find_failures_in_ninja_logs(ninja_logs)
+            for action_name, failure_message in ninja_failures:
+                failures.append({
+                    "name": action_name, 
+                    "message": failure_message
+                })
+                
+        return failures
 
-    Args:
-      commit_sha: The base commit SHA for this PR run.
-      build_log_files: The list of JUnit XML files and ninja logs.
-      github_token: The token to use to access the Github API.
-      pr_number: The number of the PR associated with this run.
-      return_code: The numerical return code of ninja/CMake.
-    """
-    if return_code == 0:
-        with open("comment", "w") as comment_file_handle:
-            comment = get_comment(
-                github_token,
-                pr_number,
-                ":white_check_mark: With the latest revision this PR passed "
-                "the premerge checks.",
-            )
-            if "id" in comment:
-                json.dump([comment], comment_file_handle)
-    junit_objects, ninja_logs = generate_test_report_lib.load_info_from_files(
-        build_log_files
-    )
-    test_failures = generate_test_report_lib.get_failures(junit_objects)
+
+def main(commit_sha: str, build_log_files: list[str], github_token: str,
+         pr_number: int, return_code: int):
+    """Função principal do script."""
+    
+    # Skip em ARM64 temporariamente
+    if platform.machine() == "arm64":
+        print("Skipping premerge advisor on ARM64")
+        return
+
     current_platform = f"{platform.system()}-{platform.machine()}".lower()
-    explanation_request = {
-        "base_commit_sha": commit_sha,
-        "platform": current_platform,
-        "failures": [],
-    }
-    if test_failures:
-        for _, failures in test_failures.items():
-            for name, failure_messsage in failures:
-                explanation_request["failures"].append(
-                    {"name": name, "message": failure_messsage}
-                )
-    else:
-        ninja_failures = generate_test_report_lib.find_failure_in_ninja_logs(ninja_logs)
-        for name, failure_message in ninja_failures:
-            explanation_request["failures"].append(
-                {"name": name, "message": failure_message}
-            )
-    advisor_response = requests.get(
-        PREMERGE_ADVISOR_URL, json=explanation_request, timeout=5
+    comment_manager = GitHubCommentManager(github_token, pr_number)
+    
+    if return_code == 0:
+        # Build bem-sucedido - atualiza comentário existente
+        comment_body = (
+            ":white_check_mark: With the latest revision this PR passed "
+            "the premerge checks."
+        )
+        comment_data = comment_manager.prepare_comment_data(comment_body, current_platform)
+        
+        with open("comment", "w", encoding="utf-8") as comment_file:
+            json.dump([comment_data], comment_file)
+        return
+
+    # Build falhou - processa falhas
+    failure_collector = FailureCollector()
+    advisor_client = PremergeAdvisorClient()
+    
+    failures = failure_collector.collect_failures(build_log_files)
+    explanations = advisor_client.get_failure_explanations(commit_sha, current_platform, failures)
+    
+    # Gera relatório com explicações
+    junit_objects, ninja_logs = generate_test_report_lib.load_info_from_files(build_log_files)
+    report = generate_test_report_lib.generate_report(
+        generate_test_report_lib.compute_platform_title(),
+        return_code,
+        junit_objects,
+        ninja_logs,
+        failure_explanations_list=explanations or []
     )
-    if advisor_response.status_code == 200:
-        print(advisor_response.json())
-        comments = [
-            get_comment(
-                github_token,
-                pr_number,
-                generate_test_report_lib.generate_report(
-                    generate_test_report_lib.compute_platform_title(),
-                    return_code,
-                    junit_objects,
-                    ninja_logs,
-                    failure_explanations_list=advisor_response.json(),
-                ),
-            )
-        ]
-        with open("comment", "w") as comment_file_handle:
-            json.dump(comments, comment_file_handle)
-    else:
-        print(advisor_response.reason)
+    
+    comment_data = comment_manager.prepare_comment_data(report, current_platform)
+    
+    with open("comment", "w", encoding="utf-8") as comment_file:
+        json.dump([comment_data], comment_file)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("commit_sha", help="The base commit SHA for the test.")
-    parser.add_argument("return_code", help="The build's return code", type=int)
-    parser.add_argument("github_token", help="Github authentication token", type=str)
-    parser.add_argument("pr_number", help="The PR number", type=int)
-    parser.add_argument(
-        "build_log_files", help="Paths to JUnit report files and ninja logs.", nargs="*"
+    parser = argparse.ArgumentParser(
+        description="Get explanations from premerge advisor and update GitHub comments"
     )
+    parser.add_argument("commit_sha", help="The base commit SHA for the test.")
+    parser.add_argument("return_code", type=int, help="The build's return code")
+    parser.add_argument("github_token", help="GitHub authentication token")
+    parser.add_argument("pr_number", type=int, help="The PR number")
+    parser.add_argument(
+        "build_log_files", 
+        nargs="*", 
+        help="Paths to JUnit report files and ninja logs."
+    )
+    
     args = parser.parse_args()
-
-    # Skip looking for results on AArch64 for now because the premerge advisor
-    # service is not available on AWS currently.
-    if platform.machine() == "arm64":
-        sys.exit(0)
 
     main(
         args.commit_sha,
